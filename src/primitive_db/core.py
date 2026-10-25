@@ -1,140 +1,191 @@
-
 import re
-import time
-from functools import wraps
 
-SUPPORTED_TYPES = {'int', 'str', 'bool', 'float'}
-IDENTIFIER_PATTER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+from primitive_db.constants import VALID_TYPES
+from primitive_db.decorators import (
+    confirm_action,
+    create_cacher,
+    handle_db_errors,
+    log_time,
+)
+from primitive_db.utils import load_table_data
 
+IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SELECT_CACHE = create_cacher()
 
-class InvalidValueError(Exception):
-    """Ошибка при некорректном значении команды."""
-
-    def __init__(self, value):
-        self.value = value
-        super().__init__(str(value))
-
-
-class TableAlreadyExistsError(Exception):
-    """Попытка создать уже существующую таблицу."""
-
-
-class TableNotFoundError(Exception):
-    """Обращение к несуществующей таблице."""
 
 
 def validate_identifier(value):
-    """Проверяет имя таблицы или столбца."""
-    if not IDENTIFIER_PATTER.fullmatch(value):
-        raise InvalidValueError(value)
+
+    if not IDENTIFIER_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"Некорректное значение: {value}. Попробуйте снова."
+        )
 
 
+def require_table(metadata, table_name):
+
+    if table_name not in metadata:
+        raise KeyError(f'Таблица "{table_name}" не существует.')
+
+
+def _validate_type(value, expected_type):
+
+    valid = (
+        (expected_type == "int" and type(value) is int)
+        or (expected_type == "str" and isinstance(value, str))
+        or (expected_type == "bool" and type(value) is bool)
+        or (expected_type == "float" and type(value) is float)
+    )
+
+    if not valid:
+        raise ValueError(
+            f"Некорректное значение: {value}. "
+            f"Ожидается тип {expected_type}."
+        )
+
+
+def _matches(row, where_clause):
+
+    return all(
+        key in row and row[key] == value
+        for key, value in where_clause.items()
+    )
+
+
+@handle_db_errors
 def create_table(metadata, table_name, columns):
-    """Создаёт таблицу и возвращает обновлённые метаданные."""
+
     validate_identifier(table_name)
 
     if table_name in metadata:
-        raise TableAlreadyExistsError(table_name)
+        raise ValueError(f'Таблица "{table_name}" уже существует.')
+
+    if not columns:
+        raise ValueError("Необходимо указать хотя бы один столбец.")
 
     schema = {}
 
     for definition in columns:
         if definition.count(":") != 1:
-            raise InvalidValueError(definition)
+            raise ValueError(
+                f"Некорректное значение: {definition}. "
+                "Ожидается формат имя:тип."
+            )
 
         column_name, column_type = definition.split(":", 1)
+        validate_identifier(column_name)
 
-        if not IDENTIFIER_PATTER.fullmatch(column_name):
-            raise InvalidValueError(definition)
-
-        if column_type not in SUPPORTED_TYPES:
-            raise InvalidValueError(definition)
+        if column_type not in VALID_TYPES:
+            raise ValueError(
+                f"Некорректное значение: {definition}. "
+                "Допустимые типы: int, str, bool."
+            )
 
         if column_name == "ID":
             if column_type != "int" or "ID" in schema:
-                raise InvalidValueError(definition)
+                raise ValueError("Столбец ID должен иметь тип int.")
             continue
 
         if column_name in schema:
-            raise InvalidValueError(definition)
+            raise ValueError(
+                f"Некорректное значение: повтор столбца {column_name}."
+            )
 
         schema[column_name] = column_type
 
     metadata[table_name] = {"ID": "int", **schema}
-
     return metadata
 
 
+@handle_db_errors
+@confirm_action("удаление таблицы")
 def drop_table(metadata, table_name):
-    """Удаляет таблицу из метаданных."""
+
     validate_identifier(table_name)
+    require_table(metadata, table_name)
 
-    if table_name not in metadata:
-        raise TableNotFoundError(table_name)
-
-    metadata[table_name] = {}
-
-    return metadata[table_name]
+    del metadata[table_name]
+    return metadata
 
 
 def list_tables(metadata):
-    """Возвращает отсортированный список имён таблиц."""
-    return sorted(metadata.keys())
+
+    return sorted(metadata)
 
 
+@handle_db_errors
+@log_time
+def insert(metadata, table_name, values, table_data=None):
+    require_table(metadata, table_name)
 
-def confirm_action(action_name):
-    """Запрашивает подтверждение перед выполнением функции."""
+    if table_data is None:
+        table_data = load_table_data(table_name)
 
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            answer = input(
-                f'Вы уверены, что хотите выполнить '
-                f'"{action_name}"? [y/n]: '
-            ).strip().lower()
+    schema = metadata[table_name]
+    columns = [name for name in schema if name != "ID"]
 
-            if answer != "y":
-                print("Операция отменена.")
-                return None
+    if len(values) != len(columns):
+        raise ValueError(
+            f"Ожидается {len(columns)} значений, "
+            f"получено {len(values)}."
+        )
 
-            return func(*args, **kwargs)
+    record = {}
 
-        return wrapper
+    for column_name, value in zip(columns, values):
+        _validate_type(value, schema[column_name])
+        record[column_name] = value
 
-    return decorator
+    existing_ids = [
+        row["ID"]
+        for row in table_data
+        if type(row.get("ID")) is int
+    ]
+    new_id = max(existing_ids, default=0) + 1
 
-
-def log_time(func):
-    """Измеряет время выполнения функции."""
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start = time.monotonic()
-
-        try:
-            return func(*args, **kwargs)
-        finally:
-            elapsed = time.monotonic() - start
-            print(
-                f"Функция {func.__name__} "
-                f"выполнилась за {elapsed:.4f} секунд."
-            )
-
-    return wrapper
+    table_data.append({"ID": new_id, **record})
+    return table_data
 
 
-def create_cacher():
-    """Создаёт кэш с помощью замыкания."""
+@handle_db_errors
+@log_time
+def select(table_data, where_clause=None):
 
-    cache = {}
+    if where_clause is None:
+        where_clause = {}
 
-    def cache_result(key, value_func):
-        if key in cache:
-            return cache[key]
+    key = (repr(table_data), repr(where_clause))
 
-        result = value_func()
-        cache[key] = result
-        return result
+    return SELECT_CACHE(
+        key,
+        lambda: [
+            row.copy()
+            for row in table_data
+            if _matches(row, where_clause)
+        ],
+    )
 
-    return cache_result
+
+@handle_db_errors
+def update(table_data, set_clause, where_clause):
+
+    if not set_clause:
+        raise ValueError("Не указаны поля для обновления.")
+
+    for row in table_data:
+        if _matches(row, where_clause):
+            row.update(set_clause)
+
+    return table_data
+
+
+@handle_db_errors
+@confirm_action("удаление записей")
+def delete(table_data, where_clause):
+
+    table_data[:] = [
+        row for row in table_data
+        if not _matches(row, where_clause)
+    ]
+
+    return table_data
